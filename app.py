@@ -1,21 +1,48 @@
 #!/usr/bin/env python3
-"""Loan Processing Pipeline Tracker — Single-file Flask app."""
+"""Loan Processing Pipeline Tracker — Single-file Flask app.
 
-import json, os, re, glob, uuid, time
-from datetime import datetime, date, timedelta
+A kanban-style pipeline tracker for mortgage loan processing with
+checklist management, deadline tracking, and a daily digest view.
+"""
+
+import fcntl
+import json
+import logging
+import os
+import re
+import tempfile
+import uuid
+from datetime import datetime, date
+from functools import wraps
 from pathlib import Path
-from flask import Flask, request, jsonify, render_template_string, redirect, url_for
+
+from flask import Flask, request, jsonify, render_template_string, redirect, url_for, abort
+from jinja2 import Environment
+
+# ─── Logging ───
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
+app.secret_key = os.environ.get("LOAN_TRACKER_SECRET", os.urandom(32).hex())
 
+# ─── Config ───
 DATA_DIR = Path(os.path.expanduser("~/clawd/projects/loan-tracker/data"))
 DATA_FILE = DATA_DIR / "loans.json"
 BORROWERS_DIR = Path(os.path.expanduser("~/clawd/intake/borrowers"))
+API_KEY = os.environ.get("LOAN_TRACKER_API_KEY", "")
+PORT = int(os.environ.get("LOAN_TRACKER_PORT", "8087"))
 
 STAGES = [
     "Application", "Processing", "Underwriting",
     "Conditional Approval", "Clear to Close", "Closing", "Funded"
 ]
+
+VALID_LOAN_TYPES = {"conventional", "fha", "va", "usda", "non-qm"}
+DATE_FIELDS = {"contract_date", "lock_expiration", "appraisal_deadline",
+               "uw_submission_deadline", "loan_approval_deadline", "closing_date"}
+ALLOWED_FIELDS = {"borrower", "co_borrower", "property_address", "loan_amount",
+                  "loan_type", "stage", "notes"} | DATE_FIELDS
 
 STAGE_CHECKLISTS = {
     "Application": [
@@ -76,29 +103,201 @@ STAGE_CHECKLISTS = {
 }
 
 FHA_EXTRAS = {
-    "Application": ["FHA case number assigned", "UFMIP calculated"],
-    "Processing": ["DPA program setup (if applicable)", "FHA appraisal requirements noted", "HOA certification (if condo)"],
-    "Underwriting": ["FHA-specific AUS (TOTAL Scorecard) reviewed"],
+    "Application": ["FHA case number assigned", "UFMIP calculated", "MIP calculations reviewed"],
+    "Processing": [
+        "DPA program setup (if applicable)",
+        "FHA appraisal requirements noted",
+        "HOA certification (if condo)",
+        "FHA property standards checklist reviewed",
+    ],
+    "Underwriting": [
+        "FHA-specific AUS (TOTAL Scorecard) reviewed",
+        "MIP premium schedule verified",
+        "FHA property standards compliance confirmed",
+    ],
 }
 
 CONV_EXTRAS = {
     "Processing": ["PMI quote obtained (if <20% down)", "Gift letter collected (if applicable)", "Reserve verification"],
 }
 
+
+# ─── Auth helpers ───
+
+def require_api_key(f):
+    """Decorator to require API key for write endpoints."""
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        if not API_KEY:
+            # No API key configured — allow (dev mode)
+            return f(*args, **kwargs)
+        provided = request.headers.get("X-API-Key", "") or request.args.get("api_key", "")
+        if provided != API_KEY:
+            return jsonify({"error": "unauthorized", "message": "Valid API key required"}), 401
+        return f(*args, **kwargs)
+    return decorated
+
+
+# ─── Validation helpers ───
+
+def validate_date_str(date_str):
+    """Validate and return a date string, or None if empty/invalid.
+
+    Accepts MM/DD/YYYY, YYYY-MM-DD, MM/DD/YY formats.
+    Returns the original string if valid, raises ValueError if invalid.
+    """
+    if not date_str or not date_str.strip():
+        return ""
+    date_str = date_str.strip()
+    for fmt in ("%m/%d/%Y", "%Y-%m-%d", "%m/%d/%y"):
+        try:
+            datetime.strptime(date_str, fmt)
+            return date_str
+        except ValueError:
+            continue
+    raise ValueError(f"Invalid date format: {date_str}. Use MM/DD/YYYY, YYYY-MM-DD, or MM/DD/YY")
+
+
+def validate_loan_amount(amount_str):
+    """Validate loan amount is numeric (or empty)."""
+    if not amount_str or not str(amount_str).strip():
+        return ""
+    cleaned = str(amount_str).replace(",", "").replace("$", "").strip()
+    try:
+        val = float(cleaned)
+        if val < 0:
+            raise ValueError("Loan amount cannot be negative")
+        return cleaned
+    except (ValueError, TypeError):
+        raise ValueError(f"Invalid loan amount: {amount_str}. Must be numeric.")
+
+
+def validate_api_input(data, require_borrower=True):
+    """Validate API input data. Returns cleaned data or raises ValueError."""
+    errors = []
+
+    # Reject unknown fields
+    known = ALLOWED_FIELDS | {"dates"}
+    unknown = set(data.keys()) - known
+    if unknown:
+        errors.append(f"Unknown fields: {', '.join(unknown)}")
+
+    # Required fields
+    if require_borrower:
+        borrower = data.get("borrower", "").strip() if isinstance(data.get("borrower"), str) else ""
+        if not borrower:
+            errors.append("borrower name is required")
+
+    # Validate loan_type
+    if "loan_type" in data:
+        if data["loan_type"] not in VALID_LOAN_TYPES:
+            errors.append(f"Invalid loan_type: {data['loan_type']}. Must be one of: {', '.join(sorted(VALID_LOAN_TYPES))}")
+
+    # Validate stage
+    if "stage" in data:
+        if data["stage"] not in STAGES:
+            errors.append(f"Invalid stage: {data['stage']}")
+
+    # Validate loan amount
+    if "loan_amount" in data:
+        try:
+            validate_loan_amount(data["loan_amount"])
+        except ValueError as e:
+            errors.append(str(e))
+
+    # Validate date fields (top-level)
+    for df in DATE_FIELDS:
+        if df in data and data[df]:
+            try:
+                validate_date_str(data[df])
+            except ValueError as e:
+                errors.append(str(e))
+
+    # Validate dates dict
+    if "dates" in data and isinstance(data["dates"], dict):
+        for dk, dv in data["dates"].items():
+            if dk not in DATE_FIELDS:
+                errors.append(f"Unknown date field: {dk}")
+            elif dv:
+                try:
+                    validate_date_str(dv)
+                except ValueError as e:
+                    errors.append(str(e))
+
+    if errors:
+        raise ValueError("; ".join(errors))
+
+
 # ─── Data helpers ───
 
 def load_loans():
-    if DATA_FILE.exists():
+    """Load loans from JSON file with corruption recovery."""
+    if not DATA_FILE.exists():
+        return {}
+    try:
         with open(DATA_FILE) as f:
-            return json.load(f)
-    return {}
+            fcntl.flock(f, fcntl.LOCK_SH)
+            try:
+                return json.load(f)
+            finally:
+                fcntl.flock(f, fcntl.LOCK_UN)
+    except json.JSONDecodeError:
+        logger.error("loans.json is corrupted, attempting backup recovery")
+        backup = DATA_FILE.with_suffix(".json.bak")
+        if backup.exists():
+            try:
+                with open(backup) as f:
+                    data = json.load(f)
+                logger.info("Recovered from backup")
+                return data
+            except (json.JSONDecodeError, OSError) as e:
+                logger.error("Backup also corrupted: %s", e)
+        return {}
+    except OSError as e:
+        logger.error("Failed to read loans.json: %s", e)
+        return {}
+
 
 def save_loans(loans):
+    """Save loans atomically with file locking and proper permissions."""
     DATA_DIR.mkdir(parents=True, exist_ok=True)
-    with open(DATA_FILE, "w") as f:
-        json.dump(loans, f, indent=2, default=str)
+
+    # Backup current file before writing
+    if DATA_FILE.exists():
+        backup = DATA_FILE.with_suffix(".json.bak")
+        try:
+            import shutil
+            shutil.copy2(DATA_FILE, backup)
+            os.chmod(str(backup), 0o600)
+        except OSError as e:
+            logger.warning("Failed to create backup: %s", e)
+
+    # Atomic write: write to temp file, then rename
+    try:
+        fd, tmp_path = tempfile.mkstemp(dir=str(DATA_DIR), suffix=".json.tmp")
+        try:
+            with os.fdopen(fd, "w") as f:
+                fcntl.flock(f, fcntl.LOCK_EX)
+                try:
+                    json.dump(loans, f, indent=2, default=str)
+                finally:
+                    fcntl.flock(f, fcntl.LOCK_UN)
+            os.chmod(tmp_path, 0o600)
+            os.replace(tmp_path, str(DATA_FILE))
+        except Exception:
+            # Clean up temp file on failure
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+            raise
+    except OSError as e:
+        logger.error("Failed to save loans: %s", e)
+        raise
+
 
 def build_checklist(stage, loan_type="conventional"):
+    """Build a checklist for a given stage and loan type."""
     items = list(STAGE_CHECKLISTS.get(stage, []))
     if loan_type == "fha":
         items.extend(FHA_EXTRAS.get(stage, []))
@@ -106,11 +305,29 @@ def build_checklist(stage, loan_type="conventional"):
         items.extend(CONV_EXTRAS.get(stage, []))
     return {item: {"done": False, "completed_at": None, "completed_by": None} for item in items}
 
+
 def build_all_checklists(loan_type="conventional"):
+    """Build checklists for all stages for a given loan type."""
     return {stage: build_checklist(stage, loan_type) for stage in STAGES}
 
+
+def rebuild_checklists_preserving(old_checklists, new_loan_type):
+    """Rebuild checklists for new loan type, preserving completed items that exist in both."""
+    new_checklists = build_all_checklists(new_loan_type)
+    for stage in STAGES:
+        old_cl = old_checklists.get(stage, {})
+        new_cl = new_checklists.get(stage, {})
+        for item in new_cl:
+            if item in old_cl and old_cl[item].get("done"):
+                new_cl[item] = old_cl[item]
+    return new_checklists
+
+
 def make_loan(name, **kwargs):
+    """Create a new loan record with default values."""
     loan_type = kwargs.get("loan_type", "conventional")
+    if loan_type not in VALID_LOAN_TYPES:
+        loan_type = "conventional"
     return {
         "id": kwargs.get("id", str(uuid.uuid4())[:8]),
         "borrower": name,
@@ -133,18 +350,31 @@ def make_loan(name, **kwargs):
         "milestones": [],
     }
 
+
 def seed_borrower_files():
-    """Read borrower .md files and seed loans if not already present."""
+    """Read borrower .md files from BORROWERS_DIR and seed loans if not already present.
+
+    Validates file paths stay within BORROWERS_DIR to prevent path traversal.
+    """
     loans = load_loans()
     if not BORROWERS_DIR.exists():
         return loans
+    resolved_base = BORROWERS_DIR.resolve()
     existing_names = {l["borrower"].lower() for l in loans.values()}
     for md in BORROWERS_DIR.glob("*.md"):
+        # Path traversal protection
+        resolved_path = md.resolve()
+        if not str(resolved_path).startswith(str(resolved_base) + os.sep) and resolved_path != resolved_base:
+            logger.warning("Skipping file outside borrowers dir: %s", md)
+            continue
         try:
             text = md.read_text()
-        except Exception:
+        except PermissionError:
+            logger.warning("Permission denied reading %s", md)
             continue
-        # Parse basic fields from markdown
+        except OSError as e:
+            logger.warning("Error reading %s: %s", md, e)
+            continue
         name = md.stem.replace("-", " ").replace("_", " ").title()
         if name.lower() in existing_names:
             continue
@@ -164,12 +394,17 @@ def seed_borrower_files():
             if "closing" in ll and "date" in ll:
                 dates = re.findall(r'\d{1,2}/\d{1,2}/\d{2,4}', line)
                 if dates:
-                    kwargs["closing_date"] = dates[0]
+                    try:
+                        validate_date_str(dates[0])
+                        kwargs["closing_date"] = dates[0]
+                    except ValueError:
+                        pass
         loan = make_loan(name, **kwargs)
         loans[loan["id"]] = loan
         existing_names.add(name.lower())
     save_loans(loans)
     return loans
+
 
 def seed_hardcoded():
     """Seed the two known urgent files if not present."""
@@ -193,18 +428,22 @@ def seed_hardcoded():
     save_loans(loans)
     return loans
 
+
 def days_until(date_str):
-    if not date_str:
+    """Calculate days until a given date string. Returns None for empty/invalid dates."""
+    if not date_str or not str(date_str).strip():
         return None
     for fmt in ("%m/%d/%Y", "%Y-%m-%d", "%m/%d/%y"):
         try:
-            d = datetime.strptime(date_str, fmt).date()
+            d = datetime.strptime(str(date_str).strip(), fmt).date()
             return (d - date.today()).days
         except ValueError:
             continue
     return None
 
+
 def deadline_class(days):
+    """Return CSS class based on days until deadline."""
     if days is None:
         return ""
     if days < 0:
@@ -215,13 +454,14 @@ def deadline_class(days):
         return "yellow"
     return "green"
 
+
 # ─── Startup ───
 
 with app.app_context():
     seed_borrower_files()
     seed_hardcoded()
 
-# ─── HTML Template ───
+# ─── HTML Template (auto-escaping enabled) ───
 
 TEMPLATE = r"""<!DOCTYPE html>
 <html lang="en">
@@ -316,20 +556,20 @@ KANBAN_PAGE = """{% extends "base" %}{% block content %}
 <div class="kanban-col">
 <h3>{{ stage }} ({{ stage_loans[stage]|length }})</h3>
 {% for loan in stage_loans[stage] %}
-<a href="/loan/{{ loan.id }}" style="text-decoration:none;color:inherit">
+<a href="/loan/{{ loan.id|e }}" style="text-decoration:none;color:inherit">
 <div class="kanban-card">
-<div class="name">{{ loan.borrower }}{% if loan.co_borrower %} & {{ loan.co_borrower }}{% endif %}</div>
+<div class="name">{{ loan.borrower|e }}{% if loan.co_borrower %} &amp; {{ loan.co_borrower|e }}{% endif %}</div>
 <div class="meta">
 {% if loan.loan_amount %}${{ "{:,.0f}".format(loan.loan_amount|float) }}{% endif %}
-{{ loan.loan_type|upper }}
+{{ loan.loan_type|upper|e }}
 </div>
-{% if loan.property_address %}<div class="meta">{{ loan.property_address }}</div>{% endif %}
+{% if loan.property_address %}<div class="meta">{{ loan.property_address|e }}</div>{% endif %}
 <div class="deadline-badges">
 {% for dname, dval in loan.dates.items() %}
 {% if dval %}
 {% set days = days_until(dval) %}
 {% if days is not none %}
-<span class="badge {{ deadline_class(days) }}">{{ dname.replace('_',' ').title() }}: {{ days }}d</span>
+<span class="badge {{ deadline_class(days) }}">{{ dname.replace('_',' ').title()|e }}: {{ days }}d</span>
 {% endif %}
 {% endif %}
 {% endfor %}
@@ -347,30 +587,30 @@ LOAN_PAGE = """{% extends "base" %}{% block content %}
 <div class="loan-header">
 <div style="display:flex;justify-content:space-between;align-items:start;flex-wrap:wrap;gap:8px">
 <div>
-<h2>{{ loan.borrower }}{% if loan.co_borrower %} & {{ loan.co_borrower }}{% endif %}</h2>
+<h2>{{ loan.borrower|e }}{% if loan.co_borrower %} &amp; {{ loan.co_borrower|e }}{% endif %}</h2>
 <div class="info-grid" style="margin-top:8px">
-<div class="info-item"><span class="label">Loan Type:</span> <span class="val">{{ loan.loan_type|upper }}</span></div>
+<div class="info-item"><span class="label">Loan Type:</span> <span class="val">{{ loan.loan_type|upper|e }}</span></div>
 <div class="info-item"><span class="label">Amount:</span> <span class="val">${{ "{:,.0f}".format(loan.loan_amount|float) if loan.loan_amount else 'TBD' }}</span></div>
-<div class="info-item"><span class="label">Property:</span> <span class="val">{{ loan.property_address or 'TBD' }}</span></div>
-<div class="info-item"><span class="label">Stage:</span> <span class="val">{{ loan.stage }}</span></div>
+<div class="info-item"><span class="label">Property:</span> <span class="val">{{ loan.property_address|e or 'TBD' }}</span></div>
+<div class="info-item"><span class="label">Stage:</span> <span class="val">{{ loan.stage|e }}</span></div>
 </div>
 </div>
 <div style="display:flex;gap:8px;flex-wrap:wrap">
-<a href="/loan/{{ loan.id }}/edit" class="btn">Edit</a>
-<form method="post" action="/loan/{{ loan.id }}/delete" style="display:inline" onsubmit="return confirm('Delete this loan?')">
+<a href="/loan/{{ loan.id|e }}/edit" class="btn">Edit</a>
+<form method="post" action="/loan/{{ loan.id|e }}/delete" style="display:inline" onsubmit="return confirm('Delete this loan?')">
 <button class="btn btn-danger" type="submit">Delete</button>
 </form>
 </div>
 </div>
-{% if loan.notes %}<div style="margin-top:8px;font-size:.85rem;color:#d29922">📌 {{ loan.notes }}</div>{% endif %}
+{% if loan.notes %}<div style="margin-top:8px;font-size:.85rem;color:#d29922">📌 {{ loan.notes|e }}</div>{% endif %}
 </div>
 <!-- Stage Move -->
 <div class="stage-select">
 <span style="font-size:.85rem;color:#8b949e">Move to:</span>
 {% for s in stages %}
-<form method="post" action="/loan/{{ loan.id }}/stage" style="display:inline">
-<input type="hidden" name="stage" value="{{ s }}">
-<button class="btn {% if s == loan.stage %}btn-primary{% endif %}" type="submit" style="font-size:.75rem;padding:4px 8px">{{ s }}</button>
+<form method="post" action="/loan/{{ loan.id|e }}/stage" style="display:inline">
+<input type="hidden" name="stage" value="{{ s|e }}">
+<button class="btn {% if s == loan.stage %}btn-primary{% endif %}" type="submit" style="font-size:.75rem;padding:4px 8px">{{ s|e }}</button>
 </form>
 {% endfor %}
 </div>
@@ -381,8 +621,8 @@ LOAN_PAGE = """{% extends "base" %}{% block content %}
 {% for dname, dval in loan.dates.items() %}
 {% set days = days_until(dval) if dval else None %}
 <div class="date-card {{ deadline_class(days) if days is not none else '' }}">
-<div class="dlabel">{{ dname.replace('_',' ').title() }}</div>
-<div class="dval">{{ dval or '—' }}</div>
+<div class="dlabel">{{ dname.replace('_',' ').title()|e }}</div>
+<div class="dval">{{ dval|e or '—' }}</div>
 {% if days is not none %}<div class="countdown">{{ days }} day{{ 's' if days != 1 else '' }} {{ 'left' if days >= 0 else 'OVERDUE' }}</div>{% endif %}
 </div>
 {% endfor %}
@@ -393,19 +633,19 @@ LOAN_PAGE = """{% extends "base" %}{% block content %}
 <h3>✅ Checklists</h3>
 <div id="stage-tabs">
 {% for s in stages %}
-<span class="stage-tab {% if s == loan.stage %}active{% endif %}" onclick="showStage('{{ s }}',this)">{{ s }}</span>
+<span class="stage-tab {% if s == loan.stage %}active{% endif %}" onclick="showStage('{{ s|e }}',this)">{{ s|e }}</span>
 {% endfor %}
 </div>
 {% for s in stages %}
 <div class="stage-checklist" id="cl-{{ s|replace(' ','-') }}" style="{% if s != loan.stage %}display:none{% endif %}">
-<form method="post" action="/loan/{{ loan.id }}/checklist">
-<input type="hidden" name="stage" value="{{ s }}">
+<form method="post" action="/loan/{{ loan.id|e }}/checklist">
+<input type="hidden" name="stage" value="{{ s|e }}">
 {% for item, info in loan.checklists.get(s, {}).items() %}
 <div class="check-item">
-<input type="checkbox" name="items" value="{{ item }}" {% if info.done %}checked{% endif %}>
-<span{% if info.done %} style="text-decoration:line-through;color:#8b949e"{% endif %}>{{ item }}</span>
+<input type="checkbox" name="items" value="{{ item|e }}" {% if info.done %}checked{% endif %}>
+<span{% if info.done %} style="text-decoration:line-through;color:#8b949e"{% endif %}>{{ item|e }}</span>
 {% if info.done and info.completed_at %}
-<span class="done-info">✓ {{ info.completed_at[:10] }}{% if info.completed_by %} by {{ info.completed_by }}{% endif %}</span>
+<span class="done-info">✓ {{ info.completed_at[:10]|e }}{% if info.completed_by %} by {{ info.completed_by|e }}{% endif %}</span>
 {% endif %}
 </div>
 {% endfor %}
@@ -423,7 +663,7 @@ LOAN_PAGE = """{% extends "base" %}{% block content %}
 <h3>📋 Milestone Log</h3>
 {% for m in loan.milestones[-20:]|reverse %}
 <div style="font-size:.8rem;padding:4px 0;border-bottom:1px solid #21262d;color:#8b949e">
-<span style="color:#c9d1d9">{{ m.action }}</span> — {{ m.timestamp[:16] }}{% if m.by %} by {{ m.by }}{% endif %}
+<span style="color:#c9d1d9">{{ m.action|e }}</span> — {{ m.timestamp[:16]|e }}{% if m.by %} by {{ m.by|e }}{% endif %}
 </div>
 {% endfor %}
 </div>
@@ -441,28 +681,28 @@ el.classList.add('active');
 
 EDIT_PAGE = """{% extends "base" %}{% block content %}
 <div class="loan-detail">
-<h2 style="color:#f0f6fc;margin-bottom:16px">{% if loan %}Edit: {{ loan.borrower }}{% else %}Add New Loan{% endif %}</h2>
+<h2 style="color:#f0f6fc;margin-bottom:16px">{% if loan %}Edit: {{ loan.borrower|e }}{% else %}Add New Loan{% endif %}</h2>
 <form method="post">
 <div class="info-grid" style="gap:12px">
-<div class="form-group"><label>Borrower Name</label><input type="text" name="borrower" value="{{ loan.borrower if loan else '' }}" required></div>
-<div class="form-group"><label>Co-Borrower</label><input type="text" name="co_borrower" value="{{ loan.co_borrower if loan else '' }}"></div>
-<div class="form-group"><label>Property Address</label><input type="text" name="property_address" value="{{ loan.property_address if loan else '' }}"></div>
-<div class="form-group"><label>Loan Amount</label><input type="text" name="loan_amount" value="{{ loan.loan_amount if loan else '' }}"></div>
+<div class="form-group"><label>Borrower Name</label><input type="text" name="borrower" value="{{ loan.borrower|e if loan else '' }}" required></div>
+<div class="form-group"><label>Co-Borrower</label><input type="text" name="co_borrower" value="{{ loan.co_borrower|e if loan else '' }}"></div>
+<div class="form-group"><label>Property Address</label><input type="text" name="property_address" value="{{ loan.property_address|e if loan else '' }}"></div>
+<div class="form-group"><label>Loan Amount</label><input type="text" name="loan_amount" value="{{ loan.loan_amount|e if loan else '' }}"></div>
 <div class="form-group"><label>Loan Type</label>
 <select name="loan_type"><option value="conventional" {% if loan and loan.loan_type=='conventional' %}selected{% endif %}>Conventional</option><option value="fha" {% if loan and loan.loan_type=='fha' %}selected{% endif %}>FHA</option><option value="va" {% if loan and loan.loan_type=='va' %}selected{% endif %}>VA</option><option value="usda" {% if loan and loan.loan_type=='usda' %}selected{% endif %}>USDA</option><option value="non-qm" {% if loan and loan.loan_type=='non-qm' %}selected{% endif %}>Non-QM</option></select></div>
 <div class="form-group"><label>Stage</label>
-<select name="stage">{% for s in stages %}<option value="{{ s }}" {% if loan and loan.stage==s %}selected{% endif %}>{{ s }}</option>{% endfor %}</select></div>
-<div class="form-group"><label>Contract Date</label><input type="text" name="contract_date" value="{{ loan.dates.contract_date if loan else '' }}" placeholder="MM/DD/YYYY"></div>
-<div class="form-group"><label>Lock Expiration</label><input type="text" name="lock_expiration" value="{{ loan.dates.lock_expiration if loan else '' }}" placeholder="MM/DD/YYYY"></div>
-<div class="form-group"><label>Appraisal Deadline</label><input type="text" name="appraisal_deadline" value="{{ loan.dates.appraisal_deadline if loan else '' }}" placeholder="MM/DD/YYYY"></div>
-<div class="form-group"><label>UW Submission Deadline</label><input type="text" name="uw_submission_deadline" value="{{ loan.dates.uw_submission_deadline if loan else '' }}" placeholder="MM/DD/YYYY"></div>
-<div class="form-group"><label>Loan Approval Deadline</label><input type="text" name="loan_approval_deadline" value="{{ loan.dates.loan_approval_deadline if loan else '' }}" placeholder="MM/DD/YYYY"></div>
-<div class="form-group"><label>Closing Date</label><input type="text" name="closing_date" value="{{ loan.dates.closing_date if loan else '' }}" placeholder="MM/DD/YYYY"></div>
+<select name="stage">{% for s in stages %}<option value="{{ s|e }}" {% if loan and loan.stage==s %}selected{% endif %}>{{ s|e }}</option>{% endfor %}</select></div>
+<div class="form-group"><label>Contract Date</label><input type="text" name="contract_date" value="{{ loan.dates.contract_date|e if loan else '' }}" placeholder="MM/DD/YYYY"></div>
+<div class="form-group"><label>Lock Expiration</label><input type="text" name="lock_expiration" value="{{ loan.dates.lock_expiration|e if loan else '' }}" placeholder="MM/DD/YYYY"></div>
+<div class="form-group"><label>Appraisal Deadline</label><input type="text" name="appraisal_deadline" value="{{ loan.dates.appraisal_deadline|e if loan else '' }}" placeholder="MM/DD/YYYY"></div>
+<div class="form-group"><label>UW Submission Deadline</label><input type="text" name="uw_submission_deadline" value="{{ loan.dates.uw_submission_deadline|e if loan else '' }}" placeholder="MM/DD/YYYY"></div>
+<div class="form-group"><label>Loan Approval Deadline</label><input type="text" name="loan_approval_deadline" value="{{ loan.dates.loan_approval_deadline|e if loan else '' }}" placeholder="MM/DD/YYYY"></div>
+<div class="form-group"><label>Closing Date</label><input type="text" name="closing_date" value="{{ loan.dates.closing_date|e if loan else '' }}" placeholder="MM/DD/YYYY"></div>
 </div>
-<div class="form-group notes-section"><label>Notes</label><textarea name="notes">{{ loan.notes if loan else '' }}</textarea></div>
+<div class="form-group notes-section"><label>Notes</label><textarea name="notes">{{ loan.notes|e if loan else '' }}</textarea></div>
 <div style="margin-top:12px;display:flex;gap:8px">
 <button class="btn btn-primary" type="submit">Save</button>
-<a href="{% if loan %}/loan/{{ loan.id }}{% else %}/{% endif %}" class="btn">Cancel</a>
+<a href="{% if loan %}/loan/{{ loan.id|e }}{% else %}/{% endif %}" class="btn">Cancel</a>
 </div>
 </form>
 </div>
@@ -470,18 +710,18 @@ EDIT_PAGE = """{% extends "base" %}{% block content %}
 
 DIGEST_PAGE = """{% extends "base" %}{% block content %}
 <div class="digest">
-<h2 style="color:#f0f6fc;margin-bottom:16px">📋 Daily Digest — {{ today }}</h2>
+<h2 style="color:#f0f6fc;margin-bottom:16px">📋 Daily Digest — {{ today|e }}</h2>
 {% if not items %}
 <p style="color:#8b949e">No urgent action items today. All clear! 🎉</p>
 {% endif %}
 {% for item in items %}
 <div class="digest-item">
 <div style="display:flex;justify-content:space-between;align-items:center">
-<span class="urgency" style="color:{% if item.urgency == 'OVERDUE' %}#f85149{% elif item.urgency == 'CRITICAL' %}#f85149{% elif item.urgency == 'URGENT' %}#d29922{% else %}#3fb950{% endif %}">{{ item.urgency }}</span>
+<span class="urgency" style="color:{% if item.urgency == 'OVERDUE' %}#f85149{% elif item.urgency == 'CRITICAL' %}#f85149{% elif item.urgency == 'URGENT' %}#d29922{% else %}#3fb950{% endif %}">{{ item.urgency|e }}</span>
 <span style="font-size:.8rem;color:#8b949e">{{ item.days }} days</span>
 </div>
-<div style="font-weight:600;color:#f0f6fc;margin:4px 0">{{ item.borrower }}</div>
-<div style="font-size:.85rem;color:#c9d1d9">{{ item.message }}</div>
+<div style="font-weight:600;color:#f0f6fc;margin:4px 0">{{ item.borrower|e }}</div>
+<div style="font-size:.85rem;color:#c9d1d9">{{ item.message|e }}</div>
 </div>
 {% endfor %}
 </div>
@@ -491,6 +731,7 @@ DIGEST_PAGE = """{% extends "base" %}{% block content %}
 
 @app.route("/")
 def index():
+    """Render the kanban pipeline view."""
     loans = load_loans()
     stage_loans = {s: [] for s in STAGES}
     for loan in loans.values():
@@ -500,8 +741,10 @@ def index():
     return render_template_string(KANBAN_PAGE, stages=STAGES, stage_loans=stage_loans,
                                   days_until=days_until, deadline_class=deadline_class)
 
+
 @app.route("/loan/<lid>")
 def loan_detail(lid):
+    """Render loan detail page."""
     loans = load_loans()
     loan = loans.get(lid)
     if not loan:
@@ -509,11 +752,15 @@ def loan_detail(lid):
     return render_template_string(LOAN_PAGE, loan=loan, stages=STAGES,
                                   days_until=days_until, deadline_class=deadline_class)
 
+
 @app.route("/loan/<lid>/stage", methods=["POST"])
 def loan_stage(lid):
+    """Move a loan to a different stage."""
     loans = load_loans()
     if lid in loans:
         new_stage = request.form.get("stage", loans[lid]["stage"])
+        if new_stage not in STAGES:
+            return redirect(f"/loan/{lid}")
         old_stage = loans[lid]["stage"]
         if new_stage != old_stage:
             loans[lid]["stage"] = new_stage
@@ -525,12 +772,16 @@ def loan_stage(lid):
             save_loans(loans)
     return redirect(f"/loan/{lid}")
 
+
 @app.route("/loan/<lid>/checklist", methods=["POST"])
 def loan_checklist(lid):
+    """Update checklist items for a loan stage."""
     loans = load_loans()
     if lid not in loans:
         return redirect("/")
     stage = request.form.get("stage", "")
+    if stage not in STAGES:
+        return redirect(f"/loan/{lid}")
     checked = set(request.form.getlist("items"))
     by = request.form.get("completed_by", "").strip()
     now = datetime.now().isoformat()
@@ -551,44 +802,69 @@ def loan_checklist(lid):
     save_loans(loans)
     return redirect(f"/loan/{lid}")
 
+
 @app.route("/loan/<lid>/edit", methods=["GET", "POST"])
 def loan_edit(lid):
+    """Edit an existing loan."""
     loans = load_loans()
     loan = loans.get(lid)
     if not loan:
         return redirect("/")
     if request.method == "POST":
-        loan["borrower"] = request.form.get("borrower", loan["borrower"])
+        borrower = request.form.get("borrower", "").strip()
+        if not borrower:
+            borrower = loan["borrower"]
+        loan["borrower"] = borrower
         loan["co_borrower"] = request.form.get("co_borrower", "")
         loan["property_address"] = request.form.get("property_address", "")
-        loan["loan_amount"] = request.form.get("loan_amount", "")
+
+        # Validate loan amount
+        raw_amount = request.form.get("loan_amount", "")
+        try:
+            loan["loan_amount"] = validate_loan_amount(raw_amount)
+        except ValueError:
+            loan["loan_amount"] = raw_amount  # Keep as-is for web form
+
         old_type = loan["loan_type"]
-        loan["loan_type"] = request.form.get("loan_type", "conventional")
+        new_type = request.form.get("loan_type", "conventional")
+        if new_type in VALID_LOAN_TYPES:
+            loan["loan_type"] = new_type
         loan["stage"] = request.form.get("stage", loan["stage"])
+        if loan["stage"] not in STAGES:
+            loan["stage"] = old_type
         loan["notes"] = request.form.get("notes", "")
         for dk in loan["dates"]:
             loan["dates"][dk] = request.form.get(dk, "")
-        # Rebuild checklists if loan type changed
+        # Rebuild checklists if loan type changed, preserving completed items
         if loan["loan_type"] != old_type:
-            loan["checklists"] = build_all_checklists(loan["loan_type"])
+            loan["checklists"] = rebuild_checklists_preserving(loan["checklists"], loan["loan_type"])
         save_loans(loans)
         return redirect(f"/loan/{lid}")
     return render_template_string(EDIT_PAGE, loan=loan, stages=STAGES)
 
+
 @app.route("/loan/<lid>/delete", methods=["POST"])
 def loan_delete(lid):
+    """Delete a loan."""
     loans = load_loans()
     loans.pop(lid, None)
     save_loans(loans)
     return redirect("/")
 
+
 @app.route("/add", methods=["GET", "POST"])
 def add_loan():
+    """Add a new loan."""
     if request.method == "POST":
         loans = load_loans()
+        borrower = request.form.get("borrower", "").strip()
+        if not borrower:
+            borrower = "Unknown"
         lt = request.form.get("loan_type", "conventional")
+        if lt not in VALID_LOAN_TYPES:
+            lt = "conventional"
         loan = make_loan(
-            request.form.get("borrower", "Unknown"),
+            borrower,
             co_borrower=request.form.get("co_borrower", ""),
             property_address=request.form.get("property_address", ""),
             loan_amount=request.form.get("loan_amount", ""),
@@ -607,8 +883,10 @@ def add_loan():
         return redirect(f"/loan/{loan['id']}")
     return render_template_string(EDIT_PAGE, loan=None, stages=STAGES)
 
+
 @app.route("/digest")
 def digest():
+    """Render the daily digest view with urgent items."""
     loans = load_loans()
     items = []
     for loan in loans.values():
@@ -647,58 +925,112 @@ def digest():
     items.sort(key=lambda x: x["sort"])
     return render_template_string(DIGEST_PAGE, items=items, today=date.today().isoformat())
 
+
 # ─── JSON API ───
 
 @app.route("/api/loans", methods=["GET"])
 def api_loans():
+    """List all loans."""
     return jsonify(load_loans())
+
 
 @app.route("/api/loans/<lid>", methods=["GET"])
 def api_loan(lid):
+    """Get a single loan by ID."""
     loans = load_loans()
     if lid not in loans:
         return jsonify({"error": "not found"}), 404
     return jsonify(loans[lid])
 
+
 @app.route("/api/loans", methods=["POST"])
+@require_api_key
 def api_create_loan():
+    """Create a new loan via API. Requires API key if configured."""
     data = request.json or {}
+
+    # Validate input
+    try:
+        validate_api_input(data, require_borrower=True)
+    except ValueError as e:
+        return jsonify({"error": "validation_error", "message": str(e)}), 400
+
+    borrower = data.get("borrower", "").strip()
+    if not borrower:
+        return jsonify({"error": "validation_error", "message": "borrower name is required"}), 400
+
+    # Validate loan amount
+    loan_amount = data.get("loan_amount", "")
+    try:
+        loan_amount = validate_loan_amount(loan_amount)
+    except ValueError as e:
+        return jsonify({"error": "validation_error", "message": str(e)}), 400
+
     loan = make_loan(
-        data.get("borrower", "Unknown"),
-        **{k: data.get(k, "") for k in ["co_borrower", "property_address", "loan_amount", "loan_type", "stage",
+        borrower,
+        **{k: data.get(k, "") for k in ["co_borrower", "property_address", "loan_type", "stage",
                                           "contract_date", "lock_expiration", "appraisal_deadline",
-                                          "uw_submission_deadline", "loan_approval_deadline", "closing_date", "notes"]}
+                                          "uw_submission_deadline", "loan_approval_deadline", "closing_date", "notes"]},
+        loan_amount=loan_amount,
     )
     loans = load_loans()
     loans[loan["id"]] = loan
     save_loans(loans)
     return jsonify(loan), 201
 
+
 @app.route("/api/loans/<lid>", methods=["PUT"])
+@require_api_key
 def api_update_loan(lid):
+    """Update an existing loan via API. Requires API key if configured."""
     loans = load_loans()
     if lid not in loans:
         return jsonify({"error": "not found"}), 404
     data = request.json or {}
+
+    # Validate input
+    try:
+        validate_api_input(data, require_borrower=False)
+    except ValueError as e:
+        return jsonify({"error": "validation_error", "message": str(e)}), 400
+
     loan = loans[lid]
-    for k in ["borrower", "co_borrower", "property_address", "loan_amount", "loan_type", "stage", "notes"]:
+    old_type = loan["loan_type"]
+
+    for k in ["borrower", "co_borrower", "property_address", "loan_type", "stage", "notes"]:
         if k in data:
             loan[k] = data[k]
+
+    if "loan_amount" in data:
+        try:
+            loan["loan_amount"] = validate_loan_amount(data["loan_amount"])
+        except ValueError as e:
+            return jsonify({"error": "validation_error", "message": str(e)}), 400
+
     if "dates" in data:
         loan["dates"].update(data["dates"])
+
+    # Rebuild checklists if loan type changed
+    if loan.get("loan_type") != old_type:
+        loan["checklists"] = rebuild_checklists_preserving(loan["checklists"], loan["loan_type"])
+
     save_loans(loans)
     return jsonify(loan)
 
+
 @app.route("/api/loans/<lid>", methods=["DELETE"])
+@require_api_key
 def api_delete_loan(lid):
+    """Delete a loan via API. Requires API key if configured."""
     loans = load_loans()
     loans.pop(lid, None)
     save_loans(loans)
     return jsonify({"ok": True})
 
+
 @app.route("/api/digest", methods=["GET"])
 def api_digest():
-    # Reuse digest logic
+    """Get digest data as JSON."""
     loans = load_loans()
     items = []
     for loan in loans.values():
@@ -712,22 +1044,11 @@ def api_digest():
     items.sort(key=lambda x: x["days"])
     return jsonify(items)
 
-# ─── Jinja base template ───
 
-@app.context_processor
-def inject_base():
-    return {}
+# ─── Jinja base template loader ───
 
-# Register base template
-app.jinja_env.globals["base"] = TEMPLATE
-from jinja2 import DictLoader
-app.jinja_loader = type('Loader', (), {
-    'get_source': lambda self, env, name: (TEMPLATE if name == 'base' else '', name, lambda: True),
-    'list_templates': lambda self: ['base'],
-})()
-
-# Proper template loader that handles extends
 class InlineLoader:
+    """Custom Jinja2 template loader for inline templates with auto-escaping."""
     def get_source(self, environment, template):
         if template == "base":
             return TEMPLATE, "base", lambda: True
@@ -736,6 +1057,10 @@ class InlineLoader:
         return ["base"]
 
 app.jinja_loader = InlineLoader()
+# Enable auto-escaping for all templates
+app.jinja_env.autoescape = True
+
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=8087, debug=False)
+    logger.info("Starting Loan Pipeline Tracker on port %d", PORT)
+    app.run(host="0.0.0.0", port=PORT, debug=False)
